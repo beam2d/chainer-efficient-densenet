@@ -130,12 +130,17 @@ class RecomputedBNReluConv(chainer.Chain):
                 # forget phase
                 with chainer.force_backprop_mode():
                     y = self.bn(x)
-                    bn_fn = y.creator
-                    y = self.conv(F.relu(y))
-                    conv_fn = y.creator
+                bn_fn = y.creator
+                bn_fn.unchain()
+
+                y = F.relu(y)
+
+                with chainer.force_backprop_mode():
+                    y = self.conv(y)
+                conv_fn = y.creator
+                conv_fn.unchain()
+
                 out_size = y.shape
-                conv_fn.inputs[0].data = None  # cancel retain
-                y.unchain_backward()
                 return y
 
             # recompute bn using computed statistics
@@ -145,7 +150,7 @@ class RecomputedBNReluConv(chainer.Chain):
             bn_out = chainer.Variable(bn_out)
             bn_fn.inputs = x.node, self.bn.gamma.node, self.bn.beta.node
             bn_fn.outputs = weakref.ref(bn_out.node),
-            bn_out.set_creator(bn_fn)
+            bn_out.creator_node = bn_fn
             x.retain_data()
             self.bn.gamma.retain_data()
             self.bn.beta.retain_data()
@@ -160,7 +165,10 @@ class RecomputedBNReluConv(chainer.Chain):
             self.conv.W.retain_data()
             dummy_out = chainer.Variable(xp.broadcast_to(xp.empty((), dtype=h.dtype), out_size))
             conv_fn.outputs = weakref.ref(dummy_out.node),
-            dummy_out.set_creator(conv_fn)
+            dummy_out.creator_node = conv_fn
+
+            bn_fn = None
+            conv_fn = None
             return dummy_out
 
         return F.forget(forward, x)
