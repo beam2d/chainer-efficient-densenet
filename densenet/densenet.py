@@ -143,20 +143,24 @@ class RecomputedBNReluConv(chainer.Chain):
             bn_out = self._recompute_bn(x.array, self.bn.gamma.array[expander], self.bn.beta.array[expander],
                                         bn_fn.mean[expander], bn_fn.inv_std[expander])
             bn_out = chainer.Variable(bn_out)
+            bn_fn.inputs = x.node, self.bn.gamma.node, self.bn.beta.node
             bn_fn.outputs = weakref.ref(bn_out.node),
             bn_out.set_creator(bn_fn)
+            x.retain_data()
+            self.bn.gamma.retain_data()
+            self.bn.beta.retain_data()
 
             # recompute relu
             h = F.relu(bn_out)
 
             # set dummy data to convolution output
             xp = cuda.get_array_module(h.array)
-            conv_fn.inputs = h, self.conv.W
+            conv_fn.inputs = h.node, self.conv.W.node
             h.retain_data()
             self.conv.W.retain_data()
             dummy_out = chainer.Variable(xp.broadcast_to(xp.empty((), dtype=h.dtype), out_size))
             conv_fn.outputs = weakref.ref(dummy_out.node),
-            dummy_out.creator = conv
+            dummy_out.set_creator(conv_fn)
             return dummy_out
 
         return F.forget(forward, x)
