@@ -3,51 +3,13 @@ import weakref
 import chainer
 from chainer import cuda
 import chainer.functions as F
-from chainer.functions.connection.convolution_2d import Convolution2DFunction
-from chainer.functions.normalization.batch_normalization import BatchNormalization
 import chainer.links as L
-from chainer.links.caffe import caffe_function, CaffeFunction
 try:
     import cupy
     fuse = cupy.fuse
 except ImportError:
     fuse = lambda *_, **__: lambda f: f
 import numpy
-
-
-# Moncky patch to CaffeFunction: the Scale layers of pretrained DenseNet models have bias_term flag False, even though
-# they actually have bias parameters. This patch forces CaffeFunction to load bias parameters even if bias_term is
-# False.
-@caffe_function._layer('Scale', None)
-def _setup_scale(self, layer):
-    bottom = layer.bottom
-    blobs = layer.blobs
-    axis = layer.scale_param.axis
-    bias_term = True  # !!!PATCHED!!!
-
-    # Case of only one bottom where W is learnt parameter.
-    if len(bottom) == 1:
-        W_shape = blobs[0].shape.dim
-        func = L.Scale(axis, W_shape, bias_term)
-        func.W.data.ravel()[:] = blobs[0].data
-        if bias_term:
-            func.bias.b.data.ravel()[:] = blobs[1].data
-    # Case of two bottoms where W is given as a bottom.
-    else:
-        shape = blobs[0].shape.dim if bias_term else None
-        func = L.Scale(
-            axis, bias_term=bias_term, bias_shape=shape)
-        if bias_term:
-            func.bias.b.data.ravel()[:] = blobs[0].data
-
-    # Add layer.
-    with self.init_scope():
-        setattr(self, layer.name, func)
-    self.forwards[layer.name] = caffe_function._CallChildLink(self, layer.name)
-    self._add_layer(layer)
-
-
-CaffeFunction._setup_scale = _setup_scale
 
 
 class InplaceConcatenator(object):
@@ -96,16 +58,6 @@ class InplaceConcat(chainer.Function):
         gy, = grad_outputs
         n_channels_first = self.inputs[0].shape[1]
         return gy[:, :n_channels_first], gy[:, n_channels_first:]
-
-
-def _load_caffe_bn(layers, prefix):
-    bn = layers[prefix + '/bn']
-    scale = layers[prefix + '/scale']
-    with bn.init_scope():
-        bn.gamma = scale.W
-        bn.beta = scale.bias.b
-    bn.eps = max(bn.eps, 1e-5)  # the pretrained model has eps slightly less than 1e-5 which is not allowed by cuDNN
-    return bn
 
 
 class RecomputedBNReluConv(chainer.Chain):
@@ -173,10 +125,6 @@ class RecomputedBNReluConv(chainer.Chain):
 
         return F.forget(forward, x)
 
-    def load_caffe_layers(self, layers, prefix):
-        self.conv = layers[prefix]
-        self.bn = _load_caffe_bn(layers, prefix)
-
     @staticmethod
     @fuse()
     def _recompute_bn(x, gamma, beta, mean, inv_std):
@@ -200,10 +148,6 @@ class DenseLayer(chainer.Chain):
         h = self.l2(h)
         return self.concatenator.forward(x, h)
 
-    def load_caffe_layers(self, layers, prefix):
-        self.l1.load_caffe_layers(layers, prefix + '/x1')
-        self.l2.load_caffe_layers(layers, prefix + '/x2')
-
 
 class TransitionLayer(chainer.Chain):
 
@@ -217,10 +161,6 @@ class TransitionLayer(chainer.Chain):
         x = self.conv(F.relu(self.bn(x)))
         x = F.average_pooling_2d(x, 2, stride=2)
         return x
-
-    def load_caffe_layers(self, layers, prefix):
-        self.bn = _load_caffe_bn(layers, prefix)
-        self.conv = layers[prefix]
 
 
 class DenseBlock(chainer.Chain):
@@ -244,10 +184,6 @@ class DenseBlock(chainer.Chain):
         for layer in self.layers:
             x = layer(x)
         return x
-
-    def load_caffe_layers(self, layers, prefix):
-        for i, layer in enumerate(self.layers):
-            layer.load_caffe_layers(layers, '{}_{}'.format(prefix, i + 1))
 
 
 class DenseNetBC(chainer.Chain):
@@ -292,26 +228,6 @@ class DenseNetBC(chainer.Chain):
         x = F.average_pooling_2d(x, 7, stride=1)
         x = self.fc(x)
         return x
-
-    def load_caffe_model(self, model_path):
-        caffe = CaffeFunction(model_path)
-        layers = dict(caffe.namedlinks())
-
-        self.conv1 = layers['/conv1']
-        self.bn1 = _load_caffe_bn(layers, '/conv1')
-
-        for i in range(self.n_blocks):
-            conv_name = '/conv{}'.format(i + 2)
-            block = getattr(self, 'block{}'.format(i))
-            block.load_caffe_layers(layers, conv_name)
-            if i + 1 < self.n_blocks:
-                trans = getattr(self, 'trans{}'.format(i))
-                trans.load_caffe_layers(layers, conv_name + '_blk')
-
-        self.fc_bn = _load_caffe_bn(layers, conv_name + '_blk')
-        fc = layers['/fc{}'.format(self.n_blocks + 2)]  # conv
-        self.fc.W.array = fc.W.array[:, :, 0, 0]
-        self.fc.b.array = fc.b.array
 
 
 class DenseNetBC121(DenseNetBC):
